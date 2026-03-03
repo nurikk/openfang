@@ -33,6 +33,9 @@ pub struct AppState {
     pub channels_config: tokio::sync::RwLock<openfang_types::config::ChannelsConfig>,
     /// Notify handle to trigger graceful HTTP server shutdown from the API.
     pub shutdown_notify: Arc<tokio::sync::Notify>,
+    /// ClawHub response cache — prevents 429 rate limiting on rapid dashboard refreshes.
+    /// Maps cache key → (fetched_at, response_json) with 120s TTL.
+    pub clawhub_cache: DashMap<String, (Instant, serde_json::Value)>,
 }
 
 /// POST /api/agents — Spawn a new agent.
@@ -480,6 +483,10 @@ pub async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "default_provider": state.kernel.config.default_model.provider,
         "default_model": state.kernel.config.default_model.model,
         "uptime_seconds": uptime,
+        "api_listen": state.kernel.config.api_listen,
+        "home_dir": state.kernel.config.home_dir.display().to_string(),
+        "log_level": state.kernel.config.log_level,
+        "network_enabled": state.kernel.config.network_enabled,
         "agents": agents,
     }))
 }
@@ -1120,7 +1127,7 @@ const CHANNEL_REGISTRY: &[ChannelMeta] = &[
             ChannelField { key: "bot_token_env", label: "Bot Token", field_type: FieldType::Secret, env_var: Some("DISCORD_BOT_TOKEN"), required: true, placeholder: "MTIz...", advanced: false },
             ChannelField { key: "allowed_guilds", label: "Allowed Guild IDs", field_type: FieldType::List, env_var: None, required: false, placeholder: "123456789, 987654321", advanced: true },
             ChannelField { key: "default_agent", label: "Default Agent", field_type: FieldType::Text, env_var: None, required: false, placeholder: "assistant", advanced: true },
-            ChannelField { key: "intents", label: "Intents Bitmask", field_type: FieldType::Number, env_var: None, required: false, placeholder: "33280", advanced: true },
+            ChannelField { key: "intents", label: "Intents Bitmask", field_type: FieldType::Number, env_var: None, required: false, placeholder: "37376", advanced: true },
         ],
         setup_steps: &["Go to discord.com/developers/applications", "Create a bot and copy the token", "Paste it below"],
         config_template: "[channels.discord]\nbot_token_env = \"DISCORD_BOT_TOKEN\"",
@@ -2782,6 +2789,14 @@ pub async fn clawhub_search(
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
 
+    // Check cache (120s TTL)
+    let cache_key = format!("search:{}:{}", query, limit);
+    if let Some(entry) = state.clawhub_cache.get(&cache_key) {
+        if entry.0.elapsed().as_secs() < 120 {
+            return (StatusCode::OK, Json(entry.1.clone()));
+        }
+    }
+
     let cache_dir = state.kernel.config.home_dir.join(".cache").join("clawhub");
     let client = openfang_skills::clawhub::ClawHubClient::new(cache_dir);
 
@@ -2801,20 +2816,26 @@ pub async fn clawhub_search(
                     })
                 })
                 .collect();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "items": items,
-                    "next_cursor": null,
-                })),
-            )
+            let resp = serde_json::json!({
+                "items": items,
+                "next_cursor": null,
+            });
+            state.clawhub_cache.insert(cache_key, (Instant::now(), resp.clone()));
+            (StatusCode::OK, Json(resp))
         }
         Err(e) => {
-            tracing::warn!("ClawHub search failed: {e}");
+            let msg = format!("{e}");
+            tracing::warn!("ClawHub search failed: {msg}");
+            // Propagate 429 status instead of masking as 200
+            let status = if msg.contains("429") || msg.contains("rate limit") {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::OK
+            };
             (
-                StatusCode::OK,
+                status,
                 Json(
-                    serde_json::json!({"items": [], "next_cursor": null, "error": format!("{e}")}),
+                    serde_json::json!({"items": [], "next_cursor": null, "error": msg}),
                 ),
             )
         }
@@ -2846,6 +2867,14 @@ pub async fn clawhub_browse(
 
     let cursor = params.get("cursor").map(|s| s.as_str());
 
+    // Check cache (120s TTL)
+    let cache_key = format!("browse:{:?}:{}:{}", sort, limit, cursor.unwrap_or(""));
+    if let Some(entry) = state.clawhub_cache.get(&cache_key) {
+        if entry.0.elapsed().as_secs() < 120 {
+            return (StatusCode::OK, Json(entry.1.clone()));
+        }
+    }
+
     let cache_dir = state.kernel.config.home_dir.join(".cache").join("clawhub");
     let client = openfang_skills::clawhub::ClawHubClient::new(cache_dir);
 
@@ -2856,20 +2885,25 @@ pub async fn clawhub_browse(
                 .iter()
                 .map(clawhub_browse_entry_to_json)
                 .collect();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "items": items,
-                    "next_cursor": results.next_cursor,
-                })),
-            )
+            let resp = serde_json::json!({
+                "items": items,
+                "next_cursor": results.next_cursor,
+            });
+            state.clawhub_cache.insert(cache_key, (Instant::now(), resp.clone()));
+            (StatusCode::OK, Json(resp))
         }
         Err(e) => {
-            tracing::warn!("ClawHub browse failed: {e}");
+            let msg = format!("{e}");
+            tracing::warn!("ClawHub browse failed: {msg}");
+            let status = if msg.contains("429") || msg.contains("rate limit") {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::OK
+            };
             (
-                StatusCode::OK,
+                status,
                 Json(
-                    serde_json::json!({"items": [], "next_cursor": null, "error": format!("{e}")}),
+                    serde_json::json!({"items": [], "next_cursor": null, "error": msg}),
                 ),
             )
         }
@@ -2936,6 +2970,46 @@ pub async fn clawhub_skill_detail(
     }
 }
 
+/// GET /api/clawhub/skill/{slug}/code — Fetch the source code (SKILL.md) of a ClawHub skill.
+pub async fn clawhub_skill_code(
+    State(state): State<Arc<AppState>>,
+    Path(slug): Path<String>,
+) -> impl IntoResponse {
+    let cache_dir = state.kernel.config.home_dir.join(".cache").join("clawhub");
+    let client = openfang_skills::clawhub::ClawHubClient::new(cache_dir);
+
+    // Try to fetch SKILL.md first, then fallback to package.json
+    let mut code = String::new();
+    let mut filename = String::new();
+
+    if let Ok(content) = client.get_file(&slug, "SKILL.md").await {
+        code = content;
+        filename = "SKILL.md".to_string();
+    } else if let Ok(content) = client.get_file(&slug, "package.json").await {
+        code = content;
+        filename = "package.json".to_string();
+    } else if let Ok(content) = client.get_file(&slug, "skill.toml").await {
+        code = content;
+        filename = "skill.toml".to_string();
+    }
+
+    if code.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "No source code found for this skill"})),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "slug": slug,
+            "filename": filename,
+            "code": code,
+        })),
+    )
+}
+
 /// POST /api/clawhub/install — Install a skill from ClawHub.
 ///
 /// Runs the full security pipeline: SHA256 verification, format detection,
@@ -2992,13 +3066,18 @@ pub async fn clawhub_install(
             )
         }
         Err(e) => {
-            let status = if e.to_string().contains("SecurityBlocked") {
+            let msg = format!("{e}");
+            let status = if msg.contains("SecurityBlocked") {
                 StatusCode::FORBIDDEN
+            } else if msg.contains("429") || msg.contains("rate limit") {
+                StatusCode::TOO_MANY_REQUESTS
+            } else if msg.contains("Network error") || msg.contains("returned 4") || msg.contains("returned 5") {
+                StatusCode::BAD_GATEWAY
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            tracing::warn!("ClawHub install failed: {e}");
-            (status, Json(serde_json::json!({"error": format!("{e}")})))
+            tracing::warn!("ClawHub install failed: {msg}");
+            (status, Json(serde_json::json!({"error": msg})))
         }
     }
 }
@@ -3032,6 +3111,35 @@ fn server_platform() -> &'static str {
     } else {
         "linux"
     }
+}
+
+/// POST /api/hands/install — Register a hand definition at runtime.
+pub async fn install_hand(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let toml_content = body["toml"].as_str().unwrap_or("");
+    let skill_content = body["skill"].as_str().unwrap_or("");
+
+    let mut def: openfang_hands::HandDefinition = match toml::from_str(toml_content) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid HAND.toml: {e}")})),
+            );
+        }
+    };
+    if !skill_content.is_empty() {
+        def.skill_content = Some(skill_content.to_string());
+    }
+    let hand_id = def.id.clone();
+    let hand_name = def.name.clone();
+    state.kernel.hand_registry.register(def);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "installed", "hand_id": hand_id, "name": hand_name})),
+    )
 }
 
 /// GET /api/hands — List all hand definitions (marketplace).
@@ -3516,6 +3624,83 @@ pub async fn deactivate_hand(
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
+/// GET /api/hands/{hand_id}/settings — Get settings schema and current values for a hand.
+pub async fn get_hand_settings(
+    State(state): State<Arc<AppState>>,
+    Path(hand_id): Path<String>,
+) -> impl IntoResponse {
+    let settings_status = match state
+        .kernel
+        .hand_registry
+        .check_settings_availability(&hand_id)
+    {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Hand not found: {hand_id}")})),
+            );
+        }
+    };
+
+    // Find active instance config values (if any)
+    let instance_config: std::collections::HashMap<String, serde_json::Value> = state
+        .kernel
+        .hand_registry
+        .list_instances()
+        .iter()
+        .find(|i| i.hand_id == hand_id)
+        .map(|i| i.config.clone())
+        .unwrap_or_default();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "hand_id": hand_id,
+            "settings": settings_status,
+            "current_values": instance_config,
+        })),
+    )
+}
+
+/// PUT /api/hands/{hand_id}/settings — Update settings for a hand instance.
+pub async fn update_hand_settings(
+    State(state): State<Arc<AppState>>,
+    Path(hand_id): Path<String>,
+    Json(config): Json<std::collections::HashMap<String, serde_json::Value>>,
+) -> impl IntoResponse {
+    // Find active instance for this hand
+    let instance_id = state
+        .kernel
+        .hand_registry
+        .list_instances()
+        .iter()
+        .find(|i| i.hand_id == hand_id)
+        .map(|i| i.instance_id);
+
+    match instance_id {
+        Some(id) => match state.kernel.hand_registry.update_config(id, config.clone()) {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "hand_id": hand_id,
+                    "instance_id": id,
+                    "config": config,
+                })),
+            ),
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("{e}")})),
+            ),
+        },
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("No active instance for hand: {hand_id}. Activate the hand first.")})),
         ),
     }
 }
@@ -4275,6 +4460,55 @@ pub async fn agent_budget_ranking(State(state): State<Arc<AppState>>) -> impl In
     Json(serde_json::json!({"agents": agents, "total": agents.len()}))
 }
 
+/// PUT /api/budget/agents/{id} — Update per-agent budget limits at runtime.
+pub async fn update_agent_budget(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            )
+        }
+    };
+
+    let hourly = body["max_cost_per_hour_usd"].as_f64();
+    let daily = body["max_cost_per_day_usd"].as_f64();
+    let monthly = body["max_cost_per_month_usd"].as_f64();
+
+    if hourly.is_none() && daily.is_none() && monthly.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Provide at least one of: max_cost_per_hour_usd, max_cost_per_day_usd, max_cost_per_month_usd"})),
+        );
+    }
+
+    match state
+        .kernel
+        .registry
+        .update_resources(agent_id, hourly, daily, monthly)
+    {
+        Ok(()) => {
+            // Persist updated entry
+            if let Some(entry) = state.kernel.registry.get(agent_id) {
+                let _ = state.kernel.memory.save_agent(&entry);
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "ok", "message": "Agent budget updated"})),
+            )
+        }
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Session listing endpoints
 // ---------------------------------------------------------------------------
@@ -4865,6 +5099,10 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
             entry["latency_ms"] = serde_json::json!(probe.latency_ms);
             if !probe.discovered_models.is_empty() {
                 entry["discovered_models"] = serde_json::json!(probe.discovered_models);
+                // Merge discovered models into the catalog so agents can use them
+                if let Ok(mut catalog) = state.kernel.model_catalog.write() {
+                    catalog.merge_discovered_models(&p.id, &probe.discovered_models);
+                }
             }
             if let Some(err) = &probe.error {
                 entry["error"] = serde_json::json!(err);
@@ -5555,6 +5793,32 @@ pub async fn reset_session(
     }
 }
 
+/// DELETE /api/agents/{id}/history — Clear ALL conversation history for an agent.
+pub async fn clear_agent_history(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            )
+        }
+    };
+    match state.kernel.clear_agent_history(agent_id) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "message": "All history cleared"})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
 /// POST /api/agents/{id}/session/compact — Trigger LLM session compaction.
 pub async fn compact_session(
     State(state): State<Arc<AppState>>,
@@ -5639,6 +5903,92 @@ pub async fn set_model(
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({"status": "ok", "model": model})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
+/// GET /api/agents/{id}/tools — Get an agent's tool allowlist/blocklist.
+pub async fn get_agent_tools(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            )
+        }
+    };
+    let entry = match state.kernel.registry.get(agent_id) {
+        Some(e) => e,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Agent not found"})),
+            )
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "tool_allowlist": entry.manifest.tool_allowlist,
+            "tool_blocklist": entry.manifest.tool_blocklist,
+        })),
+    )
+}
+
+/// PUT /api/agents/{id}/tools — Update an agent's tool allowlist/blocklist.
+pub async fn set_agent_tools(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            )
+        }
+    };
+    let allowlist = body
+        .get("tool_allowlist")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        });
+    let blocklist = body
+        .get("tool_blocklist")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        });
+
+    if allowlist.is_none() && blocklist.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Provide 'tool_allowlist' and/or 'tool_blocklist'"})),
+        );
+    }
+
+    match state
+        .kernel
+        .set_agent_tool_filters(agent_id, allowlist, blocklist)
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok"})),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -5957,14 +6307,25 @@ pub async fn test_provider(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let (env_var, base_url, key_required) = {
+    let (env_var, base_url, key_required, default_model) = {
         let catalog = state
             .kernel
             .model_catalog
             .read()
             .unwrap_or_else(|e| e.into_inner());
         match catalog.get_provider(&name) {
-            Some(p) => (p.api_key_env.clone(), p.base_url.clone(), p.key_required),
+            Some(p) => {
+                // Find a default model for this provider to use in the test request
+                let model_id = catalog
+                    .default_model_for_provider(&name)
+                    .unwrap_or_default();
+                (
+                    p.api_key_env.clone(),
+                    p.base_url.clone(),
+                    p.key_required,
+                    model_id,
+                )
+            }
             None => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -5999,7 +6360,7 @@ pub async fn test_provider(
         Ok(driver) => {
             // Send a minimal completion request to test connectivity
             let test_req = openfang_runtime::llm_driver::CompletionRequest {
-                model: String::new(), // Driver will use default
+                model: default_model.clone(),
                 messages: vec![openfang_types::message::Message::user("Hi")],
                 tools: vec![],
                 max_tokens: 1,
@@ -6103,16 +6464,25 @@ pub async fn set_provider_url(
     let probe =
         openfang_runtime::provider_health::probe_provider(&name, &base_url).await;
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "saved",
-            "provider": name,
-            "base_url": base_url,
-            "reachable": probe.reachable,
-            "latency_ms": probe.latency_ms,
-        })),
-    )
+    // Merge discovered models into catalog
+    if !probe.discovered_models.is_empty() {
+        if let Ok(mut catalog) = state.kernel.model_catalog.write() {
+            catalog.merge_discovered_models(&name, &probe.discovered_models);
+        }
+    }
+
+    let mut resp = serde_json::json!({
+        "status": "saved",
+        "provider": name,
+        "base_url": base_url,
+        "reachable": probe.reachable,
+        "latency_ms": probe.latency_ms,
+    });
+    if !probe.discovered_models.is_empty() {
+        resp["discovered_models"] = serde_json::json!(probe.discovered_models);
+    }
+
+    (StatusCode::OK, Json(resp))
 }
 
 /// Upsert a provider URL in the `[provider_urls]` section of config.toml.
@@ -6708,6 +7078,29 @@ pub async fn create_schedule(
     }
 
     let agent_id_str = req["agent_id"].as_str().unwrap_or("").to_string();
+    if agent_id_str.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing required field: agent_id"})),
+        );
+    }
+    // Validate agent exists (UUID or name lookup)
+    let agent_exists = if let Ok(aid) = agent_id_str.parse::<AgentId>() {
+        state.kernel.registry.get(aid).is_some()
+    } else {
+        state
+            .kernel
+            .registry
+            .list()
+            .iter()
+            .any(|a| a.name == agent_id_str)
+    };
+    if !agent_exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Agent not found: {agent_id_str}")})),
+        );
+    }
     let message = req["message"].as_str().unwrap_or("").to_string();
     let enabled = req.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
 
@@ -6881,10 +7274,14 @@ pub async fn run_schedule(
         .unwrap_or("Scheduled task triggered manually.");
     let name = schedule["name"].as_str().unwrap_or("(unnamed)");
 
-    // Find the target agent
+    // Find the target agent — require explicit agent_id, no silent fallback
     let target_agent = if !agent_id_str.is_empty() {
         if let Ok(aid) = agent_id_str.parse::<AgentId>() {
-            Some(aid)
+            if state.kernel.registry.get(aid).is_some() {
+                Some(aid)
+            } else {
+                None
+            }
         } else {
             state
                 .kernel
@@ -6895,7 +7292,7 @@ pub async fn run_schedule(
                 .map(|a| a.id)
         }
     } else {
-        state.kernel.registry.list().first().map(|a| a.id)
+        None
     };
 
     let target_agent = match target_agent {
@@ -6936,7 +7333,8 @@ pub async fn run_schedule(
         serde_json::Value::Array(schedules_updated),
     );
 
-    match state.kernel.send_message(target_agent, &run_message).await {
+    let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
+    match state.kernel.send_message_with_handle(target_agent, &run_message, Some(kernel_handle)).await {
         Ok(result) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -7040,7 +7438,7 @@ pub async fn update_agent_identity(
 // Agent Config Hot-Update
 // ---------------------------------------------------------------------------
 
-/// Request body for patching agent config (name, description, prompt, identity).
+/// Request body for patching agent config (name, description, prompt, identity, model).
 #[derive(serde::Deserialize)]
 pub struct PatchAgentConfigRequest {
     pub name: Option<String>,
@@ -7052,6 +7450,10 @@ pub struct PatchAgentConfigRequest {
     pub archetype: Option<String>,
     pub vibe: Option<String>,
     pub greeting_style: Option<String>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub api_key_env: Option<String>,
+    pub base_url: Option<String>,
 }
 
 /// PATCH /api/agents/{id}/config — Hot-update agent name, description, system prompt, and identity.
@@ -7204,6 +7606,58 @@ pub async fn patch_agent_config(
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": "Agent not found"})),
             );
+        }
+    }
+
+    // Update model/provider
+    if let Some(ref new_model) = req.model {
+        if !new_model.is_empty() {
+            if let Some(ref new_provider) = req.provider {
+                if !new_provider.is_empty() {
+                    if state
+                        .kernel
+                        .registry
+                        .update_model_and_provider(
+                            agent_id,
+                            new_model.clone(),
+                            new_provider.clone(),
+                        )
+                        .is_err()
+                    {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({"error": "Agent not found"})),
+                        );
+                    }
+                } else if state
+                    .kernel
+                    .registry
+                    .update_model(agent_id, new_model.clone())
+                    .is_err()
+                {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"error": "Agent not found"})),
+                    );
+                }
+            } else if state
+                .kernel
+                .registry
+                .update_model(agent_id, new_model.clone())
+                .is_err()
+            {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "Agent not found"})),
+                );
+            }
+        }
+    }
+
+    // Persist updated manifest to database so changes survive restart
+    if let Some(entry) = state.kernel.registry.get(agent_id) {
+        if let Err(e) = state.kernel.memory.save_agent(&entry) {
+            tracing::warn!("Failed to persist agent config update: {e}");
         }
     }
 
@@ -8020,7 +8474,19 @@ pub async fn config_reload(State(state): State<Arc<AppState>>) -> impl IntoRespo
 // ---------------------------------------------------------------------------
 
 /// GET /api/config/schema — Return a simplified JSON description of the config structure.
-pub async fn config_schema() -> impl IntoResponse {
+pub async fn config_schema(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    // Build provider/model options from model catalog for dropdowns
+    let catalog = state.kernel.model_catalog.read().unwrap_or_else(|e| e.into_inner());
+    let provider_options: Vec<String> = catalog.list_providers().iter().map(|p| p.id.clone()).collect();
+    let model_options: Vec<serde_json::Value> = catalog
+        .list_models()
+        .iter()
+        .map(|m| serde_json::json!({"id": m.id, "name": m.display_name, "provider": m.provider}))
+        .collect();
+    drop(catalog);
+
     Json(serde_json::json!({
         "sections": {
             "api": {
@@ -8031,9 +8497,10 @@ pub async fn config_schema() -> impl IntoResponse {
                 }
             },
             "default_model": {
+                "hot_reloadable": true,
                 "fields": {
-                    "provider": "string",
-                    "model": "string",
+                    "provider": { "type": "select", "options": provider_options },
+                    "model": { "type": "select", "options": model_options },
                     "api_key_env": "string",
                     "base_url": "string"
                 }
@@ -8978,6 +9445,391 @@ pub async fn copilot_oauth_poll(
         openfang_runtime::copilot_oauth::DeviceFlowStatus::Error(e) => (
             StatusCode::OK,
             Json(serde_json::json!({"status": "error", "error": e})),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Agent Communication (Comms) endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /api/comms/topology — Build agent topology graph from registry.
+pub async fn comms_topology(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    use openfang_types::comms::{EdgeKind, TopoEdge, TopoNode, Topology};
+
+    let agents = state.kernel.registry.list();
+
+    let nodes: Vec<TopoNode> = agents
+        .iter()
+        .map(|e| TopoNode {
+            id: e.id.to_string(),
+            name: e.name.clone(),
+            state: format!("{:?}", e.state),
+            model: e.manifest.model.model.clone(),
+        })
+        .collect();
+
+    let mut edges: Vec<TopoEdge> = Vec::new();
+
+    // Parent-child edges from registry
+    for agent in &agents {
+        for child_id in &agent.children {
+            edges.push(TopoEdge {
+                from: agent.id.to_string(),
+                to: child_id.to_string(),
+                kind: EdgeKind::ParentChild,
+            });
+        }
+    }
+
+    // Peer message edges from event bus history
+    let events = state.kernel.event_bus.history(500).await;
+    let mut peer_pairs = std::collections::HashSet::new();
+    for event in &events {
+        if let openfang_types::event::EventPayload::Message(_) = &event.payload {
+            if let openfang_types::event::EventTarget::Agent(target_id) = &event.target {
+                let from = event.source.to_string();
+                let to = target_id.to_string();
+                // Deduplicate: only one edge per pair, skip self-loops
+                if from != to {
+                    let key = if from < to {
+                        (from.clone(), to.clone())
+                    } else {
+                        (to.clone(), from.clone())
+                    };
+                    if peer_pairs.insert(key) {
+                        edges.push(TopoEdge {
+                            from,
+                            to,
+                            kind: EdgeKind::Peer,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Json(serde_json::to_value(Topology { nodes, edges }).unwrap_or_default())
+}
+
+/// Filter a kernel event into a CommsEvent, if it represents inter-agent communication.
+fn filter_to_comms_event(
+    event: &openfang_types::event::Event,
+    agents: &[openfang_types::agent::AgentEntry],
+) -> Option<openfang_types::comms::CommsEvent> {
+    use openfang_types::comms::{CommsEvent, CommsEventKind};
+    use openfang_types::event::{EventPayload, EventTarget, LifecycleEvent};
+
+    let resolve_name = |id: &str| -> String {
+        agents
+            .iter()
+            .find(|a| a.id.to_string() == id)
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| id.to_string())
+    };
+
+    match &event.payload {
+        EventPayload::Message(msg) => {
+            let target_id = match &event.target {
+                EventTarget::Agent(id) => id.to_string(),
+                _ => String::new(),
+            };
+            Some(CommsEvent {
+                id: event.id.to_string(),
+                timestamp: event.timestamp.to_rfc3339(),
+                kind: CommsEventKind::AgentMessage,
+                source_id: event.source.to_string(),
+                source_name: resolve_name(&event.source.to_string()),
+                target_id: target_id.clone(),
+                target_name: resolve_name(&target_id),
+                detail: openfang_types::truncate_str(&msg.content, 200).to_string(),
+            })
+        }
+        EventPayload::Lifecycle(lifecycle) => match lifecycle {
+            LifecycleEvent::Spawned { agent_id, name } => Some(CommsEvent {
+                id: event.id.to_string(),
+                timestamp: event.timestamp.to_rfc3339(),
+                kind: CommsEventKind::AgentSpawned,
+                source_id: event.source.to_string(),
+                source_name: resolve_name(&event.source.to_string()),
+                target_id: agent_id.to_string(),
+                target_name: name.clone(),
+                detail: format!("Agent '{}' spawned", name),
+            }),
+            LifecycleEvent::Terminated { agent_id, reason } => Some(CommsEvent {
+                id: event.id.to_string(),
+                timestamp: event.timestamp.to_rfc3339(),
+                kind: CommsEventKind::AgentTerminated,
+                source_id: event.source.to_string(),
+                source_name: resolve_name(&event.source.to_string()),
+                target_id: agent_id.to_string(),
+                target_name: resolve_name(&agent_id.to_string()),
+                detail: format!("Terminated: {}", reason),
+            }),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Convert an audit entry into a CommsEvent if it represents inter-agent activity.
+fn audit_to_comms_event(
+    entry: &openfang_runtime::audit::AuditEntry,
+    agents: &[openfang_types::agent::AgentEntry],
+) -> Option<openfang_types::comms::CommsEvent> {
+    use openfang_types::comms::{CommsEvent, CommsEventKind};
+
+    let resolve_name = |id: &str| -> String {
+        agents
+            .iter()
+            .find(|a| a.id.to_string() == id)
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| {
+                if id.is_empty() || id == "system" {
+                    "system".to_string()
+                } else {
+                    openfang_types::truncate_str(id, 12).to_string()
+                }
+            })
+    };
+
+    let action_str = format!("{:?}", entry.action);
+    let (kind, detail, target_label) = match action_str.as_str() {
+        "AgentMessage" => {
+            // Format detail: "tokens_in=X, tokens_out=Y" → readable summary
+            let detail = if entry.detail.starts_with("tokens_in=") {
+                let parts: Vec<&str> = entry.detail.split(", ").collect();
+                let in_tok = parts.first().and_then(|p| p.strip_prefix("tokens_in=")).unwrap_or("?");
+                let out_tok = parts.get(1).and_then(|p| p.strip_prefix("tokens_out=")).unwrap_or("?");
+                if entry.outcome == "ok" {
+                    format!("{} in / {} out tokens", in_tok, out_tok)
+                } else {
+                    format!("{} in / {} out — {}", in_tok, out_tok, openfang_types::truncate_str(&entry.outcome, 80))
+                }
+            } else if entry.outcome != "ok" {
+                format!("{} — {}", openfang_types::truncate_str(&entry.detail, 80), openfang_types::truncate_str(&entry.outcome, 80))
+            } else {
+                openfang_types::truncate_str(&entry.detail, 200).to_string()
+            };
+            (CommsEventKind::AgentMessage, detail, "user")
+        }
+        "AgentSpawn" => (
+            CommsEventKind::AgentSpawned,
+            format!("Agent spawned: {}", openfang_types::truncate_str(&entry.detail, 100)),
+            "",
+        ),
+        "AgentKill" => (
+            CommsEventKind::AgentTerminated,
+            format!("Agent killed: {}", openfang_types::truncate_str(&entry.detail, 100)),
+            "",
+        ),
+        _ => return None,
+    };
+
+    Some(CommsEvent {
+        id: format!("audit-{}", entry.seq),
+        timestamp: entry.timestamp.clone(),
+        kind,
+        source_id: entry.agent_id.clone(),
+        source_name: resolve_name(&entry.agent_id),
+        target_id: if target_label.is_empty() { String::new() } else { target_label.to_string() },
+        target_name: if target_label.is_empty() { String::new() } else { target_label.to_string() },
+        detail,
+    })
+}
+
+/// GET /api/comms/events — Return recent inter-agent communication events.
+///
+/// Sources from both the event bus (for lifecycle events with full context)
+/// and the audit log (for message/spawn/kill events that are always captured).
+pub async fn comms_events(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100)
+        .min(500);
+
+    let agents = state.kernel.registry.list();
+
+    // Primary source: event bus (has full source/target context)
+    let bus_events = state.kernel.event_bus.history(500).await;
+    let mut comms_events: Vec<openfang_types::comms::CommsEvent> = bus_events
+        .iter()
+        .filter_map(|e| filter_to_comms_event(e, &agents))
+        .collect();
+
+    // Secondary source: audit log (always populated, wider coverage)
+    let audit_entries = state.kernel.audit_log.recent(500);
+    let seen_ids: std::collections::HashSet<String> =
+        comms_events.iter().map(|e| e.id.clone()).collect();
+
+    for entry in audit_entries.iter().rev() {
+        if let Some(ev) = audit_to_comms_event(entry, &agents) {
+            if !seen_ids.contains(&ev.id) {
+                comms_events.push(ev);
+            }
+        }
+    }
+
+    // Sort by timestamp descending (newest first)
+    comms_events.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    comms_events.truncate(limit);
+
+    Json(comms_events)
+}
+
+/// GET /api/comms/events/stream — SSE stream of inter-agent communication events.
+///
+/// Polls the audit log every 500ms for new inter-agent events.
+pub async fn comms_events_stream(
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<
+        Result<axum::response::sse::Event, std::convert::Infallible>,
+    >(256);
+
+    tokio::spawn(async move {
+        let mut last_seq: u64 = {
+            let entries = state.kernel.audit_log.recent(1);
+            entries.last().map(|e| e.seq).unwrap_or(0)
+        };
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            let agents = state.kernel.registry.list();
+            let entries = state.kernel.audit_log.recent(50);
+
+            for entry in &entries {
+                if entry.seq <= last_seq {
+                    continue;
+                }
+                if let Some(comms_event) = audit_to_comms_event(entry, &agents) {
+                    let data = serde_json::to_string(&comms_event).unwrap_or_default();
+                    if tx.send(Ok(Event::default().data(data))).await.is_err() {
+                        return; // Client disconnected
+                    }
+                }
+            }
+
+            if let Some(last) = entries.last() {
+                last_seq = last.seq;
+            }
+        }
+    });
+
+    let rx_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    Sse::new(rx_stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("ping"),
+        )
+        .into_response()
+}
+
+/// POST /api/comms/send — Send a message from one agent to another.
+pub async fn comms_send(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<openfang_types::comms::CommsSendRequest>,
+) -> impl IntoResponse {
+    // Validate from agent exists
+    let from_id: openfang_types::agent::AgentId = match req.from_agent_id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid from_agent_id"})),
+            )
+        }
+    };
+    if state.kernel.registry.get(from_id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Source agent not found"})),
+        );
+    }
+
+    // Validate to agent exists
+    let to_id: openfang_types::agent::AgentId = match req.to_agent_id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid to_agent_id"})),
+            )
+        }
+    };
+    if state.kernel.registry.get(to_id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Target agent not found"})),
+        );
+    }
+
+    // SECURITY: Limit message size
+    if req.message.len() > 64 * 1024 {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"error": "Message too large (max 64KB)"})),
+        );
+    }
+
+    match state.kernel.send_message(to_id, &req.message).await {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "response": result.response,
+                "input_tokens": result.total_usage.input_tokens,
+                "output_tokens": result.total_usage.output_tokens,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Message delivery failed: {e}")})),
+        ),
+    }
+}
+
+/// POST /api/comms/task — Post a task to the agent task queue.
+pub async fn comms_task(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<openfang_types::comms::CommsTaskRequest>,
+) -> impl IntoResponse {
+    if req.title.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Title is required"})),
+        );
+    }
+
+    match state
+        .kernel
+        .memory
+        .task_post(
+            &req.title,
+            &req.description,
+            req.assigned_to.as_deref(),
+            Some("ui-user"),
+        )
+        .await
+    {
+        Ok(task_id) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "ok": true,
+                "task_id": task_id,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to post task: {e}")})),
         ),
     }
 }
